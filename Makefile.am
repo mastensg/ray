@@ -10,3 +10,9 @@ ray_LDFLAGS = -pthread
 ray_headless_SOURCES = main_headless.c ray.c 3dmath.c 3dmath.h
 ray_headless_LDADD = -lm
 ray_headless_LDFLAGS = -pthread
+
+TESTS = ./test-profile-arcs.sh
+
+.PHONY: test
+
+test: check
