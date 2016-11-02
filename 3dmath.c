@@ -1,25 +1,25 @@
+#include "3dmath.h"
+
 #include <math.h>
 
-#define POW2(x) ((x) * (x))
-
 float
-dot(float x[3], float y[3]) {
+dot(const float x[3], const float y[3]) {
     return x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
 }
 
 void
 normalize(float x[3]) {
-    float len;
-    int i;
+    float len = 1.0f / sqrtf(dot(x, x));
 
-    len = sqrt(dot(x, x));
-
-    for(i = 0; i < 3; ++i)
-        x[i] /= len;
+    x[0] *= len;
+    x[1] *= len;
+    x[2] *= len;
 }
 
 float
-sphere_intersect(float y[3], float r[3], float s[3], float d[3], float c[3], float R) {
+sphere_intersect(float* restrict y, float* restrict r,
+                 const float* restrict s, const float* restrict d,
+                 const float* restrict c, float R, int invert) {
     int i;
     float D, n[3], t, v[3];
 
@@ -31,17 +31,23 @@ sphere_intersect(float y[3], float r[3], float s[3], float d[3], float c[3], flo
     if(D < 0)
         return -1;
 
-    t = -dot(v, d) - D;
+    if (invert)
+      t = -dot(v, d) + D;
+    else
+      t = -dot(v, d) - D;
+
+    if (t <= 0)
+        return -1;
 
     for(i = 0; i < 3; ++i) {
         y[i] = s[i] + t * d[i];
         n[i] = y[i] - c[i];
     }
 
-    normalize(n);
+    float two_dot_nd_div_sq_n_mag = 2.0f * dot(n, d) / dot(n, n);
 
-    for(i = 0; i < 3; ++i)
-        r[i] = d[i] - 2 * dot(n, d) * n[i];
+    for (i = 0; i < 3; ++i)
+      r[i] = d[i] - two_dot_nd_div_sq_n_mag * n[i];
 
     return t;
 }

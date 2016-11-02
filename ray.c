@@ -1,17 +1,13 @@
+#include "ray.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
-#include <GL/gl.h>
-#include <GL/glu.h>
-#include <GL/glut.h>
+#include <unistd.h>
 
 #include "3dmath.h"
-
-#define WIDTH 1000
-#define HEIGHT 1000
-#define BUFFER_SIZE (WIDTH * HEIGHT * 4)
 
 #define LENGTH(array) (sizeof(array) / sizeof(array[0]))
 #define MAX(x, y) (x > y ? x : y)
@@ -19,10 +15,20 @@
 
 #define TAU 6.28318531
 
+#if __GNUC__ >= 3
+#  define unlikely(cond) __builtin_expect ((cond), 0)
+#  define likely(cond)   __builtin_expect ((cond), 1)
+#else
+#  define unlikely(cond) (cond)
+#  define likely(cond) (cond)
+#endif
+
 typedef struct {
     float position[3];
     float radius;
     float diffuse[3];
+    float specular[3];
+    int subtract;
 } Object;
 
 typedef struct {
@@ -30,170 +36,188 @@ typedef struct {
     float diffuse[3];
 } Light;
 
-static unsigned char threaded = 0;
-static unsigned char buffer[BUFFER_SIZE];
+typedef struct {
+    pthread_mutex_t mutex;
+
+    int width, height;
+    unsigned char* buffer;
+    long next_line;
+} ThreadArg;
+
+static float* trace_vectors;
+static int trace_vectors_width, trace_vectors_height;
+
 static Object objects[] = {
-    {.position={-1.414, -1, -3}, .radius=1, .diffuse={.8, 0, .8}},
-    {.position={0, 1.414, -3}, .radius=1, .diffuse={0, .8, .8}},
-    {.position={0, 0, -3}, .radius=.25, .diffuse={.8, .8, .8}},
-    {.position={1.414, -1, -3}, .radius=1, .diffuse={.8, .8, 0}}
+    {.position={-1.414, -1, -3}, .radius=1, .diffuse={.8, .0, .8}, .specular={.7, .6, .7}, .subtract=0},
+    {.position={0, 1.414, -3}, .radius=1, .diffuse={.0, .8, .8}, .specular={.6, .7, .7}, .subtract=0},
+    {.position={0, 0, -3}, .radius=1.5, .diffuse={.8, .8, .8}, .specular={.7, .7, .7}, .subtract=1},
+    {.position={1.414, -1, -3}, .radius=1, .diffuse={.8, .8, .0}, .specular={.7, .7, .6}, .subtract=0},
+    {.position={0, 0, -3}, .radius=1.1, .diffuse={.9, .9, .9}, .specular={.9, .9, .9}, .subtract=2}
 };
-static Light lights[] = {
+static const Light lights[] = {
     {.position={-3, 3, -4}, .diffuse={0, .6, .6}},
     {.position={0, 30, -4}, .diffuse={1, 1, 1}}
 };
+static const float ambient[3] = {0.2, 0.1, 0.1};
 
 static void
-trace(float s[3], float d[3], float pixel[3], int n) {
-    int i, j, k, m;
-    float l[3], r[3], t, y[3];
+trace(const float s[3], const float d[3], float pixel[3], int n) {
+    // Reflections in concave objects can go really deep, so we need to limit
+    // the recursion depth.
+    if (n > 6) return;
 
-    for(j = 0; j < LENGTH(objects); ++j) {
-        t = sphere_intersect(y, r, s, d, objects[j].position, objects[j].radius);
+    float nearest = HUGE_VAL;
+    int nearest_object = -1;
+    float nearest_y[3];
+    float nearest_r[3];
 
-        if(t > 0) {
-            for(m = 0; m < LENGTH(lights); ++m) {
-                for(i = 0; i < 3; ++i)
-                    l[i] = lights[m].position[i] - y[i];
+    for(size_t j = 0; j < LENGTH(objects); ++j) {
+        float r[3], t, y[3];
 
-                normalize(l);
-                for(k = 0; k < 3; ++k)
-                    pixel[k] += lights[m].diffuse[k] * objects[j].diffuse[k] * (MAX(dot(l, r), 0)) / (1 << n);
+        if (objects[j].subtract == 1) continue;
 
-                trace(y, r, pixel, n + 1);
-            }
+        t = sphere_intersect(y, r, s, d, objects[j].position, objects[j].radius, 0);
+
+        if(likely(t <= 0) || t > nearest)
+          continue;
+
+        if (objects[j].subtract == 0) {
+          size_t k;
+          for (k = 0; k < LENGTH(objects); ++k) {
+              if (!objects[k].subtract) continue;
+              if (POW2(y[0] - objects[k].position[0]) + POW2(y[1] - objects[k].position[1]) + POW2(y[2] - objects[k].position[2]) > POW2(objects[k].radius)) continue;
+
+              t = sphere_intersect(y, r, s, d, objects[k].position, objects[k].radius, 1);
+
+              break;
+          }
+
+          if(likely(t <= 0) || t > nearest)
+            continue;
         }
+
+        nearest = t;
+        nearest_object = j;
+        memcpy(nearest_y, y, sizeof(nearest_y));
+        memcpy(nearest_r, r, sizeof(nearest_y));
+    }
+
+    if (nearest_object == -1) return;
+
+    trace(nearest_y, nearest_r, pixel, n + 1);
+
+    for (int k = 0; k < 3; ++k)
+        pixel[k] = pixel[k] * objects[nearest_object].specular[k] + ambient[k] * objects[nearest_object].diffuse[k];
+
+    for(int m = 0; m < LENGTH(lights); ++m) {
+        float l[3];
+        for(int i = 0; i < 3; ++i)
+            l[i] = lights[m].position[i] - nearest_y[i];
+
+        float lr_dot = dot(l, nearest_r);
+        if (lr_dot <= 0) continue;
+
+        float scale = lr_dot / sqrtf(dot(l, l)) / (1 << n);
+        // The cutoff at 0.05 is for artistic reasons; 0.0 would be more
+        // realistic.
+        if (scale <= 0.05) continue;
+
+        for(int k = 0; k < 3; ++k)
+            pixel[k] += lights[m].diffuse[k] * objects[nearest_object].diffuse[k] * scale;
     }
 }
 
 static void
-trace_line(int l, unsigned char *buf) {
-    static float s[3] = {0, 0, 0};
-    float y = l - HEIGHT / 2;
+trace_line(int l, int width, unsigned char *buf) {
+    static const float s[3] = {0, 0, 8};
 
-    for(int i = 0; i < 4 * WIDTH; i += 4) {
-        float x = (i / 4) - WIDTH / 2;
+    for(int i = 0; i < width; ++i, buf += 4) {
+        float pixel[3] = { 0, 0, 0 };
 
-        float pixel[3];
-        memset(pixel, '\0', sizeof(pixel));
+        trace(s, &trace_vectors[(l * width + i) * 3], pixel, 1);
 
-        float d[3];
-        d[0] = x / (WIDTH / 2);
-        d[1] = y / (HEIGHT / 2) * ((float)HEIGHT / (float)WIDTH);
-        d[2] = -1;
-
-        normalize(d);
-
-        trace(s, d, pixel, 1);
-
-        for(int j = 0; j < 3; ++j)
-            buf[i + j] = MIN(255 * pixel[j], 255);
+        buf[0] = MIN(pixel[0], 1.0f) * 255;
+        buf[1] = MIN(pixel[1], 1.0f) * 255;
+        buf[2] = MIN(pixel[2], 1.0f) * 255;
     }
 }
 
 static void *
 thread(void *arg) {
-    long line = (long) arg;
+    ThreadArg* thread_arg = arg;
 
-    trace_line(line, buffer + line * 4 * WIDTH);
+    for (;;) {
+        pthread_mutex_lock(&thread_arg->mutex);
+        if (thread_arg->next_line == thread_arg->height) break;
+        long line = thread_arg->next_line++;
+        pthread_mutex_unlock(&thread_arg->mutex);
 
-    pthread_exit(NULL);
+        trace_line(line, thread_arg->width, thread_arg->buffer + line * 4 * thread_arg->width);
+    }
+
+    pthread_mutex_unlock(&thread_arg->mutex);
+
+    return NULL;
 }
 
 static void
-trace_scene(unsigned char *buf) {
+initialize_trace_vectors(int width, int height) {
+    trace_vectors = calloc(width * height, 3 * sizeof(float));
+    trace_vectors_width = width;
+    trace_vectors_height = height;
+    for(int y = 0; y < height; ++y) {
+        for(int x = 0; x < width; ++x) {
+          float* d = &trace_vectors[(y * width + x) * 3];
+          d[0] = ((float)x / width - 0.5f) * 0.5f * ((float)width / height);
+          d[1] = ((float)y / height - 0.5f) * 0.5f;
+          d[2] = -1;
+          normalize(d);
+        }
+    }
+}
+
+void
+trace_scene(float time, int width, int height, unsigned char *buf, int threaded) {
+    if (trace_vectors && (trace_vectors_width != width || trace_vectors_height != height)) {
+      free(trace_vectors);
+      trace_vectors = 0;
+    }
+    if (!trace_vectors)
+      initialize_trace_vectors(width, height);
+
+    objects[0].position[0] = (1.5 + 0.35 * sin(1.1 * time + 0.0)) * cos(0.5 * time);
+    objects[0].position[1] = (1.5 + 0.35 * sin(1.1 * time + 2.5)) * sin(0.5 * time);
+    objects[1].position[0] = (1.5 + 0.35 * sin(1.1 * time + 2.0)) * cos(0.5 * time + 1/3. * TAU);
+    objects[1].position[1] = (1.5 + 0.35 * sin(1.1 * time + 1.5)) * sin(0.5 * time + 1/3. * TAU);
+    objects[3].position[0] = (1.5 + 0.35 * sin(1.1 * time + 1.0)) * cos(0.5 * time + 2/3. * TAU);
+    objects[3].position[1] = (1.5 + 0.35 * sin(1.1 * time + 0.5)) * sin(0.5 * time + 2/3. * TAU);
+    objects[2].position[2] = -3 + 0.2 * sin(time * 1.2);
+    memcpy(objects[4].position, objects[2].position, sizeof(objects[4].position));
+
     if(threaded) {
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+        ThreadArg arg;
+        memset(&arg, 0, sizeof(arg));
+        arg.width = width;
+        arg.height = height;
+        pthread_mutex_init(&arg.mutex, NULL);
+        arg.buffer = buf;
 
-        pthread_t threads[HEIGHT];
-        for(long i = 0; i < HEIGHT; ++i) {
-            int ret = pthread_create(&threads[i], &attr, thread, (void *)i);
+        int num_threads = sysconf(_SC_NPROCESSORS_CONF) - 1;
+        pthread_t* threads = NULL;
+        if (num_threads > 0) {
+          threads = calloc(sizeof(*threads), num_threads);
 
-            if(ret) {
-                fprintf(stderr, "pthread_create(): %d\n", ret);
-                exit(EXIT_FAILURE);
-            }
+          for (int i = 0; i < num_threads; ++i)
+            pthread_create(&threads[i], NULL, thread, &arg);
         }
 
-        void *status;
-        for(long i = 0; i < HEIGHT; ++i)
-            pthread_join(threads[i], &status);
+        thread(&arg);
+
+        for(int i = 0; i < num_threads; ++i)
+            pthread_join(threads[i], NULL);
+        free(threads);
     } else {
-        for(int i = 0; i < HEIGHT; ++i)
-            trace_line(i, buffer + i * 4 * WIDTH);
+        for(int i = 0; i < height; ++i)
+            trace_line(i, width, buf + i * 4 * width);
     }
-}
-
-static void
-display(void) {
-    static int count = 0;
-    ++count;
-    if(count > 10000)
-        exit(0);
-    float time = (float)glutGet(GLUT_ELAPSED_TIME) / 1000;
-
-    objects[0].position[0] = 1.5 * cos(time);
-    objects[0].position[1] = 1.5 * sin(time);
-    objects[1].position[0] = 1.5 * cos(time + 1/3. * TAU);
-    objects[1].position[1] = 1.5 * sin(time + 1/3. * TAU);
-    objects[3].position[0] = 1.5 * cos(time + 2/3. * TAU);
-    objects[3].position[1] = 1.5 * sin(time + 2/3. * TAU);
-    objects[2].position[2] = -3 + 2 * sin(time * 2);
-
-    trace_scene(buffer);
-    glDrawPixels(WIDTH, HEIGHT, GL_BGRA, GL_UNSIGNED_BYTE, buffer);
-    glutSwapBuffers();
-}
-
-static void
-reshape(int w, int h) {
-    glViewport(0, 0, w, h);
-}
-
-static void
-keyboard(unsigned char key, int x, int y) {
-    switch(key) {
-    case 27:
-        exit(EXIT_SUCCESS);
-        break;
-    case 't':
-        if(threaded)
-            threaded = 0;
-        else
-            threaded = 1;
-        break;
-    }
-}
-
-static int
-init(int argc, char **argv, int w, int h) {
-    glutInit(&argc, argv);
-
-    glutInitWindowPosition(0, 0);
-    glutInitWindowSize(w, h);
-    glutInitDisplayMode(GLUT_RGB);
-    glutCreateWindow(argv[0]);
-
-    glDepthMask(0);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-
-    return 0;
-}
-
-int
-main(int argc, char **argv) {
-    if (init(argc, argv, WIDTH, HEIGHT))
-        return EXIT_FAILURE;
-
-    glutDisplayFunc(display);
-    glutIdleFunc(display);
-    glutReshapeFunc(reshape);
-    glutKeyboardFunc(keyboard);
-
-    glutMainLoop();
-
-    return EXIT_SUCCESS;
 }
